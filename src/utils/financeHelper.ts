@@ -1,0 +1,493 @@
+import type { NodeData } from '@/stores/nodes'
+
+/** Rates/symbols aligned with CF Server Monitor `finance.js` FINANCE_CURRENCY_CONFIG. */
+const FINANCE_CURRENCY_CONFIG = {
+  AED: { rate: 0.5435, symbol: 'د.إ' },
+  AUD: { rate: 0.20941, symbol: 'A$' },
+  BDT: { rate: 18.02, symbol: '৳' },
+  BRL: { rate: 0.74734, symbol: 'R$' },
+  CAD: { rate: 0.20691, symbol: 'C$' },
+  CHF: { rate: 0.11746, symbol: 'CHF' },
+  CNY: { rate: 1, symbol: '¥' },
+  CZK: { rate: 3.0787, symbol: 'Kč' },
+  DKK: { rate: 0.95296, symbol: 'kr' },
+  EGP: { rate: 7.15, symbol: 'EGP' },
+  EUR: { rate: 0.1275, symbol: '€' },
+  GBP: { rate: 0.11027, symbol: '£' },
+  GTQ: { rate: 1.14, symbol: 'Q' },
+  HKD: { rate: 1.1594, symbol: 'HK$' },
+  HUF: { rate: 44.688, symbol: 'Ft' },
+  IDR: { rate: 2622.37, symbol: 'Rp' },
+  ILS: { rate: 0.43085, symbol: '₪' },
+  INR: { rate: 14.0178, symbol: '₹' },
+  ISK: { rate: 18.4626, symbol: 'kr' },
+  JPY: { rate: 23.707, symbol: '¥JPY' },
+  KRW: { rate: 224.11, symbol: '₩' },
+  KZT: { rate: 64, symbol: '₸' },
+  LKR: { rate: 44.4, symbol: 'LKR' },
+  MNT: { rate: 530, symbol: '₮' },
+  MXN: { rate: 2.5472, symbol: 'Mex$' },
+  MYR: { rate: 0.59945, symbol: 'RM' },
+  NGN: { rate: 225.6, symbol: '₦' },
+  NOK: { rate: 1.4096, symbol: 'kr' },
+  NZD: { rate: 0.2535, symbol: 'NZ$' },
+  PHP: { rate: 8.9288, symbol: '₱' },
+  PKR: { rate: 41.5, symbol: '₨' },
+  PLN: { rate: 0.54138, symbol: 'zł' },
+  RON: { rate: 0.66769, symbol: 'lei' },
+  RUB: { rate: 11.9, symbol: '₽' },
+  SAR: { rate: 0.555, symbol: '﷼' },
+  SEK: { rate: 1.3895, symbol: 'kr' },
+  SGD: { rate: 0.18975, symbol: 'S$' },
+  THB: { rate: 4.8172, symbol: '฿' },
+  TRY: { rate: 6.849, symbol: '₺' },
+  UAH: { rate: 3.6, symbol: '₴' },
+  USD: { rate: 0.14799, symbol: '$' },
+  VND: { rate: 3500, symbol: '₫' },
+  ZAR: { rate: 2.3995, symbol: 'R' },
+} as const
+
+export type CurrencyCode = keyof typeof FINANCE_CURRENCY_CONFIG
+export const SUPPORTED_FINANCE_CURRENCIES = Object.keys(FINANCE_CURRENCY_CONFIG) as CurrencyCode[]
+export const DISPLAY_FINANCE_CURRENCIES = ['CNY', 'USD', 'HKD', 'EUR', 'GBP', 'JPY'] as const satisfies readonly CurrencyCode[]
+export type ExchangeRates = Record<CurrencyCode, number>
+export type ExchangeRateSource = 'cache' | 'network' | 'stale-cache' | 'default'
+
+interface ExchangeRatesCache {
+  base: 'CNY'
+  date: string
+  fetchedAt: number
+  rates: Partial<Record<CurrencyCode, number>>
+}
+
+const CACHE_KEY = 'csm_emerald_finance_exchange_rates_cny_v1'
+const MS_PER_DAY = 24 * 60 * 60 * 1000
+const MONTH_DAYS = 30
+const LONG_TERM_YEARS = 100
+
+export const DEFAULT_EXCHANGE_RATES = Object.fromEntries(
+  Object.entries(FINANCE_CURRENCY_CONFIG).map(([currency, config]) => [currency, config.rate]),
+) as ExchangeRates
+
+export const CURRENCY_SYMBOLS = Object.fromEntries(
+  Object.entries(FINANCE_CURRENCY_CONFIG).map(([currency, config]) => [currency, config.symbol]),
+) as Record<CurrencyCode, string>
+
+const EXCHANGE_RATE_APIS = [
+  {
+    url: 'https://api.frankfurter.dev/v1/latest?from=CNY',
+    parse: (data: unknown) => (data as { rates?: unknown }).rates,
+  },
+  {
+    url: 'https://open.er-api.com/v6/latest/CNY',
+    parse: (data: unknown) => (data as { rates?: unknown }).rates,
+  },
+] as const
+/**
+ * Wire-symbol / alias → ISO code.
+ * Keys mirror CF Server Monitor `CURRENCY_ALIASES` + admin `CURRENCY_OPTIONS`
+ * (notably `¥JPY` for yen, `₣` for CHF, `kr`→SEK).
+ */
+const EXPLICIT_CURRENCY_ALIASES: Record<string, CurrencyCode> = {
+  '$': 'USD',
+  'US$': 'USD',
+  '¥': 'CNY',
+  '￥': 'CNY',
+  'RMB': 'CNY',
+  'CN¥': 'CNY',
+  '¥JPY': 'JPY',
+  'JP¥': 'JPY',
+  '€': 'EUR',
+  '£': 'GBP',
+  'HK$': 'HKD',
+  'A$': 'AUD',
+  'C$': 'CAD',
+  'CA$': 'CAD',
+  'S$': 'SGD',
+  'NZ$': 'NZD',
+  '₣': 'CHF',
+  '₩': 'KRW',
+  '₹': 'INR',
+  '฿': 'THB',
+  '₫': 'VND',
+  '₱': 'PHP',
+  'Rp': 'IDR',
+  'RP': 'IDR',
+  'RM': 'MYR',
+  '₺': 'TRY',
+  '₪': 'ILS',
+  '৳': 'BDT',
+  '₨': 'PKR',
+  'LKR': 'LKR',
+  '₮': 'MNT',
+  '₽': 'RUB',
+  'R$': 'BRL',
+  // Admin "克朗" option stores `kr`; upstream maps it to SEK.
+  'kr': 'SEK',
+  'KR': 'SEK',
+  'zł': 'PLN',
+  'ZŁ': 'PLN',
+  '₴': 'UAH',
+  '₸': 'KZT',
+  'R': 'ZAR',
+  '₦': 'NGN',
+  'EGP': 'EGP',
+  'د.إ': 'AED',
+  '﷼': 'SAR',
+  'Q': 'GTQ',
+  'Mex$': 'MXN',
+  'MEX$': 'MXN',
+}
+const CURRENCY_SYMBOL_ALIASES = createCurrencySymbolAliases()
+
+/** 完整的 symbol/alias → ISO code 映射（单一数据源） */
+export const normalizedCurrencyMap: Record<string, CurrencyCode> = Object.assign(
+  {},
+  EXPLICIT_CURRENCY_ALIASES,
+  CURRENCY_SYMBOL_ALIASES,
+) as Record<string, CurrencyCode>
+
+/** symbol → ISO code 完整映射（含共享符号，供 detectLegacyCurrency 使用） */
+export const CURRENCY_SYMBOL_TO_CODE = Object.fromEntries(
+  Object.entries(FINANCE_CURRENCY_CONFIG).map(([code, config]) => [config.symbol, code]),
+) as Record<string, CurrencyCode>
+
+export function normalizeCurrency(currency: string | null | undefined): CurrencyCode {
+  const raw = String(currency || 'CNY').trim()
+  if (!raw)
+    return 'CNY'
+
+  const upper = raw.toUpperCase()
+  if (isSupportedCurrency(upper))
+    return upper
+
+  // Match upstream: try original casing then uppercased (e.g. Rp / zł / د.إ).
+  return EXPLICIT_CURRENCY_ALIASES[raw]
+    || EXPLICIT_CURRENCY_ALIASES[upper]
+    || CURRENCY_SYMBOL_ALIASES[raw]
+    || CURRENCY_SYMBOL_ALIASES[upper]
+    || 'CNY'
+}
+
+/**
+ * Symbol used when rendering a node's configured price.
+ * Prefer the API wire value (e.g. `¥JPY`) so yen is not confused with CNY `¥`.
+ */
+export function getCurrencyDisplaySymbol(currency: string | null | undefined): string {
+  const raw = String(currency || '¥').trim() || '¥'
+  if (raw === '￥')
+    return '¥'
+
+  // Non-ISO wire symbols from CF Server Monitor — show as returned.
+  if (!/^[A-Za-z]{3}$/.test(raw))
+    return raw
+
+  return CURRENCY_SYMBOLS[normalizeCurrency(raw)] ?? raw
+}
+
+export function isSupportedCurrency(currency: string): currency is CurrencyCode {
+  return (SUPPORTED_FINANCE_CURRENCIES as readonly string[]).includes(currency)
+}
+
+function createCurrencySymbolAliases(): Record<string, CurrencyCode> {
+  const symbolEntries = Object.entries(FINANCE_CURRENCY_CONFIG).map(([currency, config]) => [
+    config.symbol.trim().toUpperCase(),
+    currency as CurrencyCode,
+  ] as const)
+
+  const symbolCounts = symbolEntries.reduce<Record<string, number>>((counts, [symbol]) => {
+    counts[symbol] = (counts[symbol] || 0) + 1
+    return counts
+  }, {})
+
+  return symbolEntries.reduce<Record<string, CurrencyCode>>((aliases, [symbol, currency]) => {
+    if (symbol && symbolCounts[symbol] === 1)
+      aliases[symbol] = currency
+
+    return aliases
+  }, {})
+}
+
+export function getTodayDateKey(date = new Date()): string {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
+}
+
+export function shouldExcludeFreeNodes(): boolean {
+  const value = getLocalStorageItem('fin_exclude_free')
+  return value === null ? true : value === 'true'
+}
+
+export function getStoredFinanceCurrency(): CurrencyCode {
+  return normalizeCurrency(getLocalStorageItem('fin_currency') || 'CNY')
+}
+
+export function setStoredFinanceCurrency(currency: CurrencyCode): void {
+  setLocalStorageItem('fin_currency', currency)
+}
+
+export function calculateTotalRemainingValueCNY(
+  nodes: NodeData[],
+  exchangeRates: ExchangeRates,
+  excludeFreeTags = true,
+  now = new Date(),
+): number {
+  return nodes.reduce((sum, node) => {
+    if (excludeFreeTags && node.tags?.includes('白嫖中'))
+      return sum
+
+    return sum + calculateRemainingValueCNY(node, exchangeRates, now)
+  }, 0)
+}
+
+export function calculateTotalValueCNY(
+  nodes: NodeData[],
+  exchangeRates: ExchangeRates,
+  excludeFreeTags = true,
+): number {
+  return nodes.reduce((sum, node) => {
+    if (excludeFreeTags && node.tags?.includes('白嫖中'))
+      return sum
+
+    return sum + getPriceCNY(node, exchangeRates)
+  }, 0)
+}
+
+export function calculateValueCNY(
+  node: NodeData,
+  exchangeRates: ExchangeRates,
+): number {
+  return getPriceCNY(node, exchangeRates)
+}
+
+export function calculateTotalMonthlyAverageCostCNY(
+  nodes: NodeData[],
+  exchangeRates: ExchangeRates,
+  excludeFreeTags = true,
+): number {
+  return nodes.reduce((sum, node) => {
+    if (excludeFreeTags && node.tags?.includes('白嫖中'))
+      return sum
+
+    return sum + calculateMonthlyAverageCostCNY(node, exchangeRates)
+  }, 0)
+}
+
+export function calculateMonthlyAverageCostCNY(
+  node: NodeData,
+  exchangeRates: ExchangeRates,
+): number {
+  const priceCNY = getPriceCNY(node, exchangeRates)
+  if (priceCNY <= 0)
+    return 0
+
+  const billingCycle = Number(node.billing_cycle)
+  if (!Number.isFinite(billingCycle) || billingCycle <= 0)
+    return 0
+
+  return priceCNY / billingCycle * MONTH_DAYS
+}
+
+export function calculateRemainingValueCNY(
+  node: NodeData,
+  exchangeRates: ExchangeRates,
+  now = new Date(),
+): number {
+  if (!node.expired_at)
+    return 0
+
+  const priceCNY = getPriceCNY(node, exchangeRates)
+  if (priceCNY <= 0)
+    return 0
+
+  const expiredAt = new Date(node.expired_at).getTime()
+  if (!Number.isFinite(expiredAt))
+    return 0
+
+  const diffMs = expiredAt - now.getTime()
+  const diffYears = diffMs / (MS_PER_DAY * 365)
+
+  if (diffYears > LONG_TERM_YEARS)
+    return priceCNY
+
+  const billingCycle = Number(node.billing_cycle)
+  const billingCycleMs = billingCycle * MS_PER_DAY
+  if (diffMs > 0 && billingCycleMs > 0)
+    return priceCNY * (diffMs / billingCycleMs)
+
+  return 0
+}
+
+export function formatFinanceAmount(amount: number, currency: CurrencyCode): {
+  currency: CurrencyCode
+  symbol: string
+  value: string
+} {
+  const safeAmount = Number.isFinite(amount) ? amount : 0
+  const value = new Intl.NumberFormat('zh-CN', {
+    maximumFractionDigits: 2,
+    minimumFractionDigits: Math.abs(safeAmount) < 100000 ? 2 : 0,
+    notation: Math.abs(safeAmount) >= 100000 ? 'compact' : 'standard',
+  }).format(safeAmount)
+
+  return {
+    currency,
+    symbol: CURRENCY_SYMBOLS[currency],
+    value,
+  }
+}
+
+export async function getDailyExchangeRates(): Promise<{
+  rates: ExchangeRates
+  source: ExchangeRateSource
+}> {
+  const today = getTodayDateKey()
+  const cached = readCachedExchangeRates()
+
+  if (cached && cached.date === today) {
+    return {
+      rates: cached.rates,
+      source: 'cache',
+    }
+  }
+
+  const fetchedRates = await fetchExchangeRates()
+  if (fetchedRates) {
+    writeCachedExchangeRates(fetchedRates, today)
+    return {
+      rates: fetchedRates,
+      source: 'network',
+    }
+  }
+
+  if (cached) {
+    return {
+      rates: cached.rates,
+      source: 'stale-cache',
+    }
+  }
+
+  return {
+    rates: DEFAULT_EXCHANGE_RATES,
+    source: 'default',
+  }
+}
+
+function getPriceCNY(node: NodeData, exchangeRates: ExchangeRates): number {
+  if (node.price_configured === false)
+    return 0
+
+  const price = Number(node.price)
+  if (!Number.isFinite(price) || price <= 0)
+    return 0
+
+  const currency = normalizeCurrency(node.currency)
+  if (currency === 'CNY')
+    return price
+
+  const rate = exchangeRates[currency] || DEFAULT_EXCHANGE_RATES[currency]
+  return rate > 0 ? price / rate : 0
+}
+
+async function fetchExchangeRates(): Promise<ExchangeRates | null> {
+  for (const api of EXCHANGE_RATE_APIS) {
+    try {
+      const response = await fetchWithTimeout(api.url)
+      if (!response.ok)
+        continue
+
+      const data = await response.json()
+      const rates = sanitizeExchangeRates(api.parse(data))
+      if (rates)
+        return rates
+    }
+    catch (error) {
+      console.warn(`获取汇率失败: ${api.url}`, error)
+    }
+  }
+
+  return null
+}
+
+export async function fetchWithTimeout(url: string, timeoutMs = 5000): Promise<Response> {
+  const controller = new AbortController()
+  const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs)
+
+  try {
+    return await fetch(url, { signal: controller.signal })
+  }
+  finally {
+    window.clearTimeout(timeoutId)
+  }
+}
+
+function readCachedExchangeRates(): { date: string, rates: ExchangeRates } | null {
+  try {
+    const rawValue = getLocalStorageItem(CACHE_KEY)
+    if (!rawValue)
+      return null
+
+    const cache = JSON.parse(rawValue) as ExchangeRatesCache
+    const rates = sanitizeExchangeRates(cache.rates)
+    if (cache.base !== 'CNY' || !cache.date || !rates)
+      return null
+
+    return {
+      date: cache.date,
+      rates,
+    }
+  }
+  catch {
+    return null
+  }
+}
+
+function writeCachedExchangeRates(rates: ExchangeRates, date: string): void {
+  const cache: ExchangeRatesCache = {
+    base: 'CNY',
+    date,
+    fetchedAt: Date.now(),
+    rates,
+  }
+  setLocalStorageItem(CACHE_KEY, JSON.stringify(cache))
+}
+
+function sanitizeExchangeRates(rates: unknown): ExchangeRates | null {
+  if (!rates || typeof rates !== 'object')
+    return null
+
+  const record = rates as Record<string, unknown>
+  const result = { CNY: 1 } as ExchangeRates
+
+  for (const currency of SUPPORTED_FINANCE_CURRENCIES) {
+    if (currency === 'CNY')
+      continue
+
+    const value = Number(record[currency])
+    result[currency] = Number.isFinite(value) && value > 0
+      ? value
+      : DEFAULT_EXCHANGE_RATES[currency]
+  }
+
+  return result
+}
+
+function getLocalStorageItem(key: string): string | null {
+  try {
+    return localStorage.getItem(key)
+  }
+  catch {
+    return null
+  }
+}
+
+function setLocalStorageItem(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value)
+  }
+  catch {
+    // 缓存失败不应阻断价值计算，下一次刷新会重新尝试获取汇率。
+  }
+}
